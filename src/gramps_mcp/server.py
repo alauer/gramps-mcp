@@ -109,8 +109,12 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     # Search & Retrieval Tools
     "find_type": {
         "description": (
-            "Search any entity type using GQL - read gql://documentation "
-            "resource first to understand syntax"
+            "Search any entity type using GQL - NOTE: GQL queries are "
+            "temporarily disabled in this tool due to upstream Gramps "
+            "Web API performance issues. Calls return a 'not found' "
+            "response. Use find_anything for full-text search instead. "
+            "Re-enable by removing the early-return in find_type_tool "
+            "once the upstream Gramps Web API GQL performance is fixed."
         ),
         "schema": SimpleFindParams,
         "handler": find_type_tool,
@@ -118,7 +122,9 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "find_anything": {
         "description": (
             "Text search across all record types - matches literal text "
-            "within records, not logical combinations"
+            "within records, not logical combinations. Recommended for "
+            "general search now that find_type's GQL is temporarily "
+            "disabled."
         ),
         "schema": SimpleSearchParams,
         "handler": find_anything_tool,
@@ -347,12 +353,17 @@ class HttpCompatibilityMiddleware:
         request/response headers used by clients.
         """
         request_headers = _collect_request_headers(scope)
-        requested_method = request_headers.get(
-            "access-control-request-method", "POST"
+        requested_headers = request_headers.get("access-control-request-headers", "")
+        # Fallback to a sensible default when the browser omits the
+        # requested-headers header, otherwise the preflight only
+        # authorizes the bare minimum.
+        default_allowed_headers = (
+            b"Content-Type, Accept, mcp-session-id, mcp-protocol-version, last-event-id"
         )
-        requested_headers = request_headers.get(
-            "access-control-request-headers", ""
-        )
+        if requested_headers:
+            allowed_headers_value = requested_headers.encode("latin-1")
+        else:
+            allowed_headers_value = default_allowed_headers
 
         # Mirror the caller's origin if it sent one, otherwise fall back
         # to a wildcard. Browsers reject ``*`` when credentials are
@@ -366,10 +377,17 @@ class HttpCompatibilityMiddleware:
                 b"access-control-allow-methods",
                 b"GET, POST, DELETE, OPTIONS, HEAD",
             ),
-            (b"access-control-allow-headers", requested_headers.encode("latin-1") or b"Content-Type, Accept, mcp-session-id, mcp-protocol-version, last-event-id"),
+            (b"access-control-allow-headers", allowed_headers_value),
             (b"access-control-max-age", b"600"),
-            (b"access-control-expose-headers", b"mcp-session-id, mcp-protocol-version"),
-            (b"vary", b"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"),
+            (
+                b"access-control-expose-headers",
+                b"mcp-session-id, mcp-protocol-version",
+            ),
+            (
+                b"vary",
+                b"Origin, Access-Control-Request-Method, "
+                b"Access-Control-Request-Headers",
+            ),
             (b"content-length", b"0"),
         ]
 
@@ -396,9 +414,7 @@ class HttpCompatibilityMiddleware:
             (b"cache-control", b"no-cache, no-transform"),
         ]
         if origin:
-            headers.append(
-                (b"access-control-allow-origin", origin.encode("latin-1"))
-            )
+            headers.append((b"access-control-allow-origin", origin.encode("latin-1")))
             headers.append((b"vary", b"Origin"))
 
         await send({"type": "http.response.start", "status": 200, "headers": headers})

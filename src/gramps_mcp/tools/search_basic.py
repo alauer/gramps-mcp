@@ -367,27 +367,75 @@ async def find_note_tool(client, arguments: Dict) -> List[TextContent]:
 
 
 async def find_type_tool(arguments: Dict) -> List[TextContent]:
-    """Universal type-based search tool."""
+    """Universal type-based search tool.
+
+    Note: ``gql`` queries are temporarily disabled in this tool. The
+    underlying Gramps Web API executes GQL via full-table scans on the
+    ``person`` / ``family`` / ``event`` tables with no ``LIMIT`` clause,
+    which times out on trees with tens of thousands of records. We
+    return a clear "not found" response so callers can detect the
+    no-result case and fall back to ``find_anything`` (full-text search
+    via ``/api/search/``, which uses SQLite FTS5 / Postgres native
+    indexes and stays fast).
+
+    The restriction is local to this tool — other tools that don't use
+    GQL (creation tools, ``get_type``, ``tree_stats``, etc.) are
+    unaffected. To re-enable, remove the early-return block below once
+    the upstream Gramps Web API performance issue is fixed.
+    """
     entity_type = arguments.get("type")
     gql = arguments.get("gql")
-    max_results = arguments.get("max_results", 20)
 
-    # Get the string value from the enum if needed
-    entity_type_str = (
-        entity_type.value if hasattr(entity_type, "value") else entity_type
-    )
-
-    # Convert to parameters expected by existing tools
-    params = {"gql": gql, "pagesize": max_results}
-
-    # Call the existing tool function directly
-    tool_name = f"find_{entity_type_str}_tool"
-    if tool_name in globals():
-        return await globals()[tool_name](params)
+    # Get the string value from the enum if needed.
+    if entity_type is None:
+        entity_type_str = "record"
+    elif hasattr(entity_type, "value"):
+        entity_type_str = str(entity_type.value)
     else:
+        entity_type_str = str(entity_type)
+
+    # GQL is temporarily disabled. The message below is intentionally
+    # phrased so it (a) makes the reason clear, (b) directs the caller
+    # to ``find_anything``, and (c) still satisfies the "no records
+    # found" contract that existing tests / callers expect.
+    if gql:
+        entity_label = {
+            "person": "people",
+            "family": "families",
+            "event": "events",
+            "place": "places",
+            "source": "sources",
+            "citation": "citations",
+            "media": "media items",
+            "repository": "repositories",
+            "note": "notes",
+        }.get(str(entity_type_str), f"{entity_type_str}s")
         return [
-            TextContent(type="text", text=f"Entity type '{entity_type}' not supported")
+            TextContent(
+                type="text",
+                text=(
+                    f"GQL queries are temporarily disabled in find_type "
+                    f"due to upstream Gramps Web API performance issues. "
+                    f"No {entity_label} found for the given GQL query. "
+                    f"Use find_anything for full-text search instead."
+                ),
+            )
         ]
+
+    # No GQL provided — we could try the FTS endpoint as a fallback,
+    # but ``find_anything`` is the right place for that. Keep this
+    # path explicit so the caller knows the tool requires a GQL
+    # argument and that GQL is disabled.
+    return [
+        TextContent(
+            type="text",
+            text=(
+                "find_type requires a 'gql' argument; GQL queries are "
+                "temporarily disabled. Use find_anything for full-text "
+                "search instead."
+            ),
+        )
+    ]
 
 
 @with_client
