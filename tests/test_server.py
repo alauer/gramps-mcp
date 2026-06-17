@@ -143,6 +143,145 @@ class TestHTTPRoutes:
             assert data["service"] == "Gramps MCP Server"
 
 
+class TestHTTPCompatibility:
+    """Test HTTP method handling for browser / probe compatibility.
+
+    The MCP streamable HTTP transport only handles GET, POST and DELETE on
+    the ``/mcp`` endpoint. Two real-world client flows need short-circuits
+    so they don't get rejected with HTTP 405:
+
+    * **CORS preflight (OPTIONS)**: browser-based MCP clients must send an
+      OPTIONS preflight before the first POST. Without a 2xx response the
+      browser cancels the request.
+    * **HEAD**: container health probes and HTTP monitors use HEAD; the
+      transport returns 405 which orchestrators interpret as a failed
+      endpoint.
+    """
+
+    @pytest.mark.asyncio
+    async def test_options_returns_204_with_cors_headers(self):
+        """OPTIONS /mcp returns 204 and the headers a browser expects."""
+        async with httpx.AsyncClient() as client:
+            response = await client.options(
+                f"{BASE_URL}/mcp",
+                headers={
+                    "Origin": "http://localhost:3000",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": (
+                        "content-type,accept,mcp-session-id"
+                    ),
+                },
+            )
+            assert response.status_code == 204
+            # Origin must be reflected for the browser to accept the response.
+            assert (
+                response.headers["access-control-allow-origin"]
+                == "http://localhost:3000"
+            )
+            # The full MCP method set must be advertised so the preflight
+            # covers POST, GET, and DELETE follow-ups.
+            allowed = {
+                m.strip().upper()
+                for m in response.headers["access-control-allow-methods"].split(",")
+            }
+            assert {"GET", "POST", "DELETE", "OPTIONS", "HEAD"}.issubset(allowed)
+            # Mirror back the headers the client asked for.
+            assert "content-type" in response.headers["access-control-allow-headers"]
+            assert "accept" in response.headers["access-control-allow-headers"]
+            assert "mcp-session-id" in response.headers["access-control-allow-headers"]
+
+    @pytest.mark.asyncio
+    async def test_options_without_origin_uses_wildcard(self):
+        """OPTIONS works even when the client doesn't send an Origin header."""
+        async with httpx.AsyncClient() as client:
+            response = await client.options(
+                f"{BASE_URL}/mcp",
+                headers={"Access-Control-Request-Method": "POST"},
+            )
+            assert response.status_code == 204
+            assert "access-control-allow-origin" in response.headers
+            assert "access-control-allow-methods" in response.headers
+
+    @pytest.mark.asyncio
+    async def test_head_returns_200(self):
+        """HEAD /mcp returns 200 so health probes don't see a 405."""
+        async with httpx.AsyncClient() as client:
+            response = await client.head(f"{BASE_URL}/mcp")
+            assert response.status_code == 200
+            # HEAD responses carry no body in HTTP/1.1; httpx enforces this
+            # and ``response.text`` is therefore empty.
+
+    @pytest.mark.asyncio
+    async def test_options_only_on_mcp_path(self):
+        """OPTIONS on a non-MCP path should not be intercepted.
+
+        The middleware is scoped to the configured MCP path so other
+        custom routes (e.g. ``/health``) keep their default Starlette
+        behavior.
+        """
+        async with httpx.AsyncClient() as client:
+            response = await client.options(f"{BASE_URL}/health")
+            # Starlette returns 405 for OPTIONS on a GET-only route - that
+            # is the expected, non-mutated behavior.
+            assert response.status_code == 405
+
+
+class TestToolSchemaCleanliness:
+    """Verify tool schemas don't leak internal implementation details.
+
+    Earlier versions of ``register_tools`` used a closure with a default
+    parameter ``handler=handler_func`` to capture the real handler. Pydantic
+    then surfaced that parameter in the public tool schema as a ``handler``
+    field of type ``"string"``. This test guards against regression.
+    """
+
+    def test_tool_schemas_have_no_handler_field(self):
+        """No registered tool should expose a ``handler`` field."""
+        from src.gramps_mcp.server import app
+
+        for tool in app._tool_manager.list_tools():
+            properties = tool.parameters.get("properties", {})
+            assert "handler" not in properties, (
+                f"Tool {tool.name!r} leaks a 'handler' field in its schema"
+            )
+
+    def test_tool_schemas_have_arguments_field(self):
+        """Every tool should expose a single ``arguments`` field."""
+        from src.gramps_mcp.server import app
+
+        for tool in app._tool_manager.list_tools():
+            properties = tool.parameters.get("properties", {})
+            assert "arguments" in properties, (
+                f"Tool {tool.name!r} is missing the 'arguments' field"
+            )
+
+    def test_tool_schemas_do_not_emit_pydantic_warnings(self):
+        """Importing the server must not trigger non-serializable-default warnings."""
+        import importlib
+        import sys
+        import warnings
+
+        # Force a fresh import so the warning machinery re-evaluates the
+        # tool registration step (where the warning would fire).
+        for mod_name in list(sys.modules):
+            if mod_name.startswith("src.gramps_mcp.server"):
+                sys.modules.pop(mod_name, None)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            importlib.import_module("src.gramps_mcp.server")
+
+        offenders = [
+            str(w.message)
+            for w in caught
+            if "non-serializable-default" in str(w.message)
+        ]
+        assert not offenders, (
+            "Server emits Pydantic non-serializable-default warnings:\n"
+            + "\n".join(offenders)
+        )
+
+
 class TestMCPProtocolCompliance:
     """Test MCP protocol compliance and communication."""
     

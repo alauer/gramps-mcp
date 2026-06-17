@@ -27,6 +27,7 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
+import anyio
 from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
@@ -212,6 +213,8 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
 
 
 # Create FastMCP app with stateless HTTP (no SSE)
+# Reason: json_response=True returns JSON instead of SSE for POST responses
+# which is friendlier for non-streaming MCP clients and tooling.
 app = FastMCP("gramps", stateless_http=True, json_response=True)
 
 
@@ -220,28 +223,203 @@ app = FastMCP("gramps", stateless_http=True, json_response=True)
 # ============================================================================
 
 
-# Register all tools dynamically from the registry
+class _ToolCallable:
+    """Wrapper that exposes a clean ``(arguments)`` signature to FastMCP.
+
+    FastMCP introspects ``inspect.signature`` of registered tool callables to
+    build the JSON schema. If a Python closure captures the real handler as a
+    default-valued parameter (e.g. ``def f(arguments, handler=real): ...``),
+    Pydantic's schema generator emits a non-serializable default warning and
+    leaks an internal ``handler`` field of type ``"string"`` into the public
+    tool schema. Using a callable instance with a single-parameter
+    ``__call__`` keeps the signature clean and matches the MCP spec, where
+    the tool input is the schema object directly.
+
+    The concrete schema is bound to ``__call__.__annotations__`` so FastMCP
+    can pick it up via ``inspect.signature(..., eval_str=True)`` and build a
+    rich Pydantic model (preserving nested types and field descriptions).
+    The annotation is set on the unbound function object so it survives the
+    bound-method wrapping that Python applies at attribute lookup.
+
+    Attributes:
+        __name__: Used by FastMCP as the tool's registered name.
+        __doc__: Used by FastMCP as the tool's description.
+    """
+
+    def __init__(self, name: str, description: str, schema, handler):
+        self.__name__ = name
+        self.__doc__ = description
+        self._handler = handler
+        # Bind the Pydantic schema as the ``arguments`` parameter type. We
+        # set the annotation on the underlying function (``__call__``) rather
+        # than the bound method so it persists for ``inspect.signature``.
+        self.__call__.__annotations__["arguments"] = schema
+
+    async def __call__(self, arguments):
+        """Dispatch the validated Pydantic model to the real tool handler."""
+        return await self._handler(arguments.model_dump())
+
+
 def register_tools():
-    """Register all tools from the registry with FastMCP."""
+    """Register all tools from the registry with FastMCP.
+
+    Each registered tool accepts a single ``arguments`` field whose schema is
+    the tool's Pydantic parameter model. The real handler is captured in a
+    callable wrapper so FastMCP's introspection only sees the public
+    ``(arguments)`` signature.
+    """
     for tool_name, tool_config in TOOL_REGISTRY.items():
+        description = tool_config["description"]
         schema = tool_config["schema"]
         handler_func = tool_config["handler"]
-        description = tool_config["description"]
+        wrapper = _ToolCallable(tool_name, description, schema, handler_func)
 
-        # Create the async handler function with proper schema annotation
-        async def create_handler(arguments, handler=handler_func):
-            return await handler(arguments.model_dump())
-
-        # Set proper metadata
-        create_handler.__name__ = tool_name
-        create_handler.__doc__ = description
-        create_handler.__annotations__ = {"arguments": schema}
-
-        # Register with FastMCP
-        app.tool(description=description)(create_handler)
+        # Register with FastMCP using the description as the tool's
+        # user-facing documentation.
+        app.tool(description=description, name=tool_name)(wrapper)
 
 
 register_tools()
+
+
+# ============================================================================
+# HTTP Compatibility Middleware
+# ============================================================================
+
+
+class HttpCompatibilityMiddleware:
+    """ASGI middleware that fills HTTP compatibility gaps for MCP clients.
+
+    The MCP Streamable HTTP transport only handles ``GET``, ``POST``, and
+    ``DELETE`` on the ``/mcp`` endpoint. Two real-world client flows are
+    rejected with HTTP 405 by the transport:
+
+    1. **CORS preflight (OPTIONS)** - Browser-based clients (Open WebUI,
+       ``mcpo``, in-browser MCP inspectors) must send a CORS preflight
+       request before their first POST. Returning 405 here stops the
+       browser from completing the handshake.
+    2. **HEAD probes** - Container orchestrators and HTTP health probes
+       use HEAD to verify the server is up. The MCP transport returns 405
+       for HEAD, which orchestrators interpret as ``"endpoint not
+       available"``.
+
+    This middleware short-circuits those two methods on the MCP path with
+    the headers each caller expects, then delegates everything else to
+    the underlying MCP application.
+
+    Attributes:
+        app: The wrapped ASGI application (the MCP streamable HTTP app).
+        mcp_path: The configured MCP endpoint path (e.g. ``"/mcp"``).
+    """
+
+    def __init__(self, app, mcp_path: str):
+        self.app = app
+        self.mcp_path = mcp_path
+
+    async def __call__(self, scope, receive, send):
+        # Only intercept on the configured HTTP scope and MCP path.
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path") != self.mcp_path:
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "").upper()
+
+        if method == "OPTIONS":
+            await self._handle_options(scope, send)
+            return
+
+        if method == "HEAD":
+            await self._handle_head(scope, send)
+            return
+
+        # Pass through everything else (GET, POST, DELETE).
+        await self.app(scope, receive, send)
+
+    async def _handle_options(self, scope, send):
+        """Respond to a CORS preflight with the MCP-required headers.
+
+        The browser sends an ``Access-Control-Request-Method`` header
+        advertising the method it intends to use. We mirror back
+        everything the transport would allow plus the common MCP
+        request/response headers used by clients.
+        """
+        request_headers = _collect_request_headers(scope)
+        requested_method = request_headers.get(
+            "access-control-request-method", "POST"
+        )
+        requested_headers = request_headers.get(
+            "access-control-request-headers", ""
+        )
+
+        # Mirror the caller's origin if it sent one, otherwise fall back
+        # to a wildcard. Browsers reject ``*`` when credentials are
+        # present, so reflecting the origin is the safe default.
+        origin = request_headers.get("origin", "*")
+        allow_origin = origin if origin != "*" else "*"
+
+        headers = [
+            (b"access-control-allow-origin", allow_origin.encode("latin-1")),
+            (
+                b"access-control-allow-methods",
+                b"GET, POST, DELETE, OPTIONS, HEAD",
+            ),
+            (b"access-control-allow-headers", requested_headers.encode("latin-1") or b"Content-Type, Accept, mcp-session-id, mcp-protocol-version, last-event-id"),
+            (b"access-control-max-age", b"600"),
+            (b"access-control-expose-headers", b"mcp-session-id, mcp-protocol-version"),
+            (b"vary", b"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"),
+            (b"content-length", b"0"),
+        ]
+
+        # If the request asked for credentials, allow them. Browsers will
+        # also accept the reflected origin in that case.
+        if request_headers.get("access-control-request-headers"):
+            headers.append((b"access-control-allow-credentials", b"true"))
+
+        await send({"type": "http.response.start", "status": 204, "headers": headers})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def _handle_head(self, scope, send):
+        """Reply to a HEAD probe with a minimal 200 response.
+
+        Health-check probes only need to know the endpoint is reachable
+        and the right CORS headers are present. We don't try to mirror
+        the GET response body (which would require consuming the MCP
+        streamable HTTP SSE flow) because probes do not inspect it.
+        """
+        request_headers = _collect_request_headers(scope)
+        origin = request_headers.get("origin")
+        headers = [
+            (b"content-type", b"text/event-stream"),
+            (b"cache-control", b"no-cache, no-transform"),
+        ]
+        if origin:
+            headers.append(
+                (b"access-control-allow-origin", origin.encode("latin-1"))
+            )
+            headers.append((b"vary", b"Origin"))
+
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": b""})
+
+
+def _collect_request_headers(scope) -> Dict[str, str]:
+    """Return a case-insensitive dict of HTTP headers from an ASGI scope."""
+    raw = scope.get("headers") or []
+    headers: Dict[str, str] = {}
+    for name, value in raw:
+        try:
+            key = name.decode("latin-1").lower()
+        except Exception:
+            continue
+        try:
+            val = value.decode("latin-1")
+        except Exception:
+            val = ""
+        headers[key] = val
+    return headers
 
 
 # ============================================================================
@@ -354,5 +532,28 @@ if __name__ == "__main__":
         app.settings.host = "0.0.0.0"  # Listen on all interfaces for Docker
         app.settings.port = 8000
 
-        # Run with streamable-http transport for production use
-        app.run(transport="streamable-http")
+        # Build the Starlette app, then add an HTTP compatibility middleware.
+        # Reason: the underlying Streamable HTTP transport only accepts
+        # GET, POST, and DELETE on the ``/mcp`` endpoint and returns 405
+        # for everything else. This breaks two real-world client flows:
+        #   1. Browser-based MCP clients (Open WebUI, mcpo, etc.) trigger
+        #      an OPTIONS preflight which is rejected with 405.
+        #   2. Health-check / monitoring probes use HEAD, which is also
+        #      rejected with 405.
+        # The middleware below short-circuits those two methods with
+        # proper headers so the rest of the protocol still works.
+        import uvicorn
+
+        starlette_app = app.streamable_http_app()
+        starlette_app.add_middleware(
+            HttpCompatibilityMiddleware,
+            mcp_path=app.settings.streamable_http_path,
+        )
+        config = uvicorn.Config(
+            starlette_app,
+            host=app.settings.host,
+            port=app.settings.port,
+            log_level=app.settings.log_level.lower(),
+        )
+        server = uvicorn.Server(config)
+        anyio.run(server.serve)
